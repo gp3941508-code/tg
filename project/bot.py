@@ -153,9 +153,20 @@ async def main() -> None:
     admin_state: dict[int, AdminState] = {}
     limiter = RateLimiter(cfg.user_rate_limit_per_sec)
 
-    client = TelegramClient("bot", cfg.api_id, cfg.api_hash)
+    bot_session_name = os.path.join(cfg.logs_dir, "bot_client")
+    client = TelegramClient(bot_session_name, cfg.api_id, cfg.api_hash)
     await client.start(bot_token=cfg.bot_token)
     me = await client.get_me()
+    if not getattr(me, "bot", False):
+        session_file = f"{bot_session_name}.session"
+        ident = getattr(me, "username", None) or getattr(me, "id", None) or "unknown"
+        logger.error(
+            "Bot did not log in (session is authorized as user: %s). Delete %s and restart.",
+            ident,
+            session_file,
+        )
+        await client.disconnect()
+        return
     bot_username = getattr(me, "username", None) or ""
 
     async def safe_send(to_id: int, text: str, *, buttons=None, parse_mode: str | None = None) -> None:
