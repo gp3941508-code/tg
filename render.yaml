@@ -1,0 +1,12 @@
+services:
+  - type: worker
+    name: telegram-bot-stock
+    env: python
+    # GitHub par Python version specify karne ke liye
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.0
+    # Dependencies install karne ki command
+    buildCommand: pip install -r requirements.txt
+    # Bot start karne ki command
+    startCommand: python bot.py
