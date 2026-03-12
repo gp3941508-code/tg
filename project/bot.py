@@ -15,6 +15,7 @@ from phonenumbers import geocoder
 
 from telethon import Button, TelegramClient, events
 from telethon.errors import FloodWaitError
+from telethon.tl.types import KeyboardButton, KeyboardButtonRow, ReplyKeyboardMarkup
 
 from admin import AdminState, handle_admin_callback, handle_admin_message, render_admin_panel
 from config import load_config
@@ -55,6 +56,48 @@ def user_menu() -> list[list[Button]]:
         [Button.inline("\U0001F6D2 Buy", b"u:buy"), Button.inline("\U0001F381 Refer & Earn", b"u:refer")],
         [Button.inline("\U0001F4B0 Deposit", b"u:deposit"), Button.inline("\U0001F6E0 Support", b"u:support")],
     ]
+
+BTN_ACCOUNT = "\U0001F464 Account"
+BTN_TX = "\U0001F4DC Transactions"
+BTN_BUY = "\U0001F6D2 Buy"
+BTN_REFER = "\U0001F381 Refer & Earn"
+BTN_DEPOSIT = "\U0001F4B0 Deposit"
+BTN_SUPPORT = "\U0001F6E0 Support"
+
+BTN_CONFIRM_BUY = "\u2705 Confirm & Buy"
+BTN_CANCEL = "\u274C Cancel"
+BTN_BACK_MENU = "\U0001F519 Menu"
+BTN_BACK_DEPOSIT = "\U0001F519 Deposit"
+
+BTN_UPI = "\U0001F4B3 UPI"
+BTN_USDT = "\U0001FA99 USDT"
+BTN_SUBMIT_UTR = "\u2705 Submit UTR"
+
+def _reply_kb(rows: list[list[str]], *, resize: bool = True) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        rows=[KeyboardButtonRow([KeyboardButton(text=t) for t in row]) for row in rows],
+        resize=resize,
+        single_use=False,
+        selective=False,
+    )
+
+def user_menu() -> ReplyKeyboardMarkup:
+    return _reply_kb(
+        [
+            [BTN_ACCOUNT, BTN_TX],
+            [BTN_BUY, BTN_REFER],
+            [BTN_DEPOSIT, BTN_SUPPORT],
+        ]
+    )
+
+def _buy_confirm_kb() -> ReplyKeyboardMarkup:
+    return _reply_kb([[BTN_CONFIRM_BUY, BTN_CANCEL], [BTN_BACK_MENU]])
+
+def _deposit_methods_kb() -> ReplyKeyboardMarkup:
+    return _reply_kb([[BTN_UPI, BTN_USDT], [BTN_BACK_MENU]])
+
+def _upi_kb() -> ReplyKeyboardMarkup:
+    return _reply_kb([[BTN_SUBMIT_UTR], [BTN_BACK_DEPOSIT, BTN_BACK_MENU]])
 
 # --- UPGRADED: Automatic Country Detection ---
 def get_country_info(phone: str) -> str:
@@ -152,6 +195,200 @@ async def main() -> None:
         val = await db.get_setting(key)
         return val if val and val.strip() else None
 
+    async def _maybe_answer(ev, *args, **kwargs) -> None:
+        fn = getattr(ev, "answer", None)
+        if callable(fn):
+            try:
+                await fn(*args, **kwargs)
+            except Exception:
+                return
+
+    async def handle_user_action(event, action: str) -> None:
+        if not limiter.allow(event.sender_id):
+            await _maybe_answer(event, "Slow down", alert=False)
+            return
+
+        u = await db.get_user(event.sender_id)
+        if u and u.is_banned:
+            await _maybe_answer(event, "Banned", alert=True)
+            return
+
+        if action == "u:account":
+            if not u:
+                await event.respond("Use /start first.", buttons=user_menu())
+                await _maybe_answer(event)
+                return
+            dash_text = await get_ui_text("dashboard_text", DEFAULT_DASHBOARD_TEXT)
+            dash_img = await get_ui_image("dashboard_image_path")
+            text = f"{dash_text}\n\n\U0001F464 **Account Info:**\nID: `{u.tg_id}`\nBalance: `{u.balance} INR`"
+            await send_page(event.chat_id, text, image_path=dash_img, buttons=user_menu())
+            await _maybe_answer(event)
+            return
+
+        if action == "u:buy":
+            if not u:
+                await event.respond("Use /start first.", buttons=user_menu())
+                await _maybe_answer(event)
+                return
+            info = await db.get_next_stock_info()
+            if not info:
+                await event.respond("\u274C Out of stock. Please try later.", buttons=user_menu())
+                await _maybe_answer(event)
+                return
+
+            country = get_country_info(info["example"])
+            text = (
+                "\U0001F6D2 **Confirm Purchase**\n\n"
+                f"\U0001F30D Country: **{country}**\n"
+                f"\U0001F4E6 Total Stock: `{info['total']}`\n"
+                f"\U0001F4B0 Price: `{info['price']} INR`\n\n"
+                f"\U0001F4B3 Your Balance: `{u.balance} INR`"
+            )
+            await event.respond(text, parse_mode="md", buttons=_buy_confirm_kb())
+            await _maybe_answer(event)
+            return
+
+        if action == "u:confirm_buy":
+            res = await stock.buy_item(event.sender_id)
+            if not res.ok:
+                await event.respond(res.message, buttons=user_menu())
+                await _maybe_answer(event)
+                return
+
+            phone_display = res.item.replace(".session", "")
+            country_info = get_country_info(phone_display)
+            await event.respond(
+                "\u2705 **Purchase Successful!**\n\n"
+                f"\U0001F4DE **Number:** `{phone_display}`\n"
+                f"\U0001F30D **Country:** {country_info}\n"
+                f"\U0001F4B0 Price: `{res.price} INR`\n\n"
+                "\u231B **Bot is now monitoring for OTP...**\n"
+                "Please login. Code will appear here.",
+                buttons=user_menu(),
+            )
+
+            session_path = Path(cfg.sessions_dir) / res.item
+            asyncio.create_task(
+                stock.start_otp_listener(
+                    session_path=session_path,
+                    user_id=event.sender_id,
+                    stock_id=res.stock_id,
+                    bot_client=client,
+                )
+            )
+            await _maybe_answer(event)
+            return
+
+        if action == "u:tx":
+            txs = await db.get_transactions(event.sender_id, limit=10)
+            if not txs:
+                await event.respond("No transactions yet.", buttons=user_menu())
+                await _maybe_answer(event)
+                return
+            lines = ["Last transactions (latest first):"]
+            for t in txs:
+                lines.append(
+                    f"#{t.get('id')} | `{t.get('type')}` | `{t.get('amount')}` | `{t.get('created_at')}`\n{(t.get('description') or '').strip()}"
+                )
+            await event.respond("\n\n".join(lines), parse_mode="md", buttons=user_menu())
+            await _maybe_answer(event)
+            return
+
+        if action == "u:refer":
+            u2 = await db.get_user(event.sender_id)
+            if not u2:
+                await event.respond("Use /start first.", buttons=user_menu())
+                await _maybe_answer(event)
+                return
+            bonus_raw = await db.get_setting("referral_bonus")
+            try:
+                bonus = int(bonus_raw) if bonus_raw else 0
+            except Exception:
+                bonus = 0
+            total = await db.referrals_count(event.sender_id)
+            referred_by = u2.referred_by
+            link = f"https://t.me/{bot_username}?start=ref_{event.sender_id}" if bot_username else f"/start ref_{event.sender_id}"
+            text = (
+                "Refer & Earn\n\n"
+                f"Your referral link:\n`{link}`\n\n"
+                f"Bonus per referral: `{bonus}`\n"
+                f"Total referrals: `{total}`\n"
+                f"Referred by: `{referred_by if referred_by else '-'}`"
+            )
+            await event.respond(text, parse_mode="md", buttons=user_menu())
+            await _maybe_answer(event)
+            return
+
+        if action == "u:last":
+            last = await db.last_purchase(event.sender_id)
+            if not last:
+                await event.respond("No history found.", buttons=user_menu())
+            else:
+                phone_display = last["item"].replace(".session", "")
+                country_info = get_country_info(phone_display)
+                otp_info = f"\n\U0001F511 **OTP:** `{last.get('otp_code')}`" if last.get("otp_code") else ""
+                await event.respond(
+                    f"\U0001F4DE **Last purchase:**\nNumber: `{phone_display}`\nCountry: {country_info}{otp_info}",
+                    buttons=user_menu(),
+                )
+            await _maybe_answer(event)
+            return
+
+        if action == "u:deposit":
+            text = await get_ui_text("deposit_text", DEFAULT_DEPOSIT_TEXT)
+            upi_id = await db.get_setting("deposit_upi_id") or "-"
+            usdt_wallet = await db.get_setting("deposit_usdt_wallet") or "-"
+            deposit_note = await db.get_setting("deposit_note") or ""
+            full = (
+                f"{text}\n\n"
+                "\u26A0\uFE0F Deposit manually add by admin.\n\n"
+                f"{BTN_UPI} ID: `{upi_id}`\n"
+                f"{BTN_USDT} Wallet: `{usdt_wallet}`\n\n"
+                f"{deposit_note}\n\n"
+                "Choose a method from the keyboard:"
+            )
+            await event.respond(full, parse_mode="md", buttons=_deposit_methods_kb())
+            await _maybe_answer(event)
+            return
+
+        if action == "u:support":
+            user_state[event.sender_id] = UserState(waiting_for="support")
+            text = await get_ui_text("support_text", DEFAULT_SUPPORT_TEXT)
+            await event.respond(text, buttons=user_menu())
+            await _maybe_answer(event)
+            return
+
+        if action == "u:dep_upi":
+            upi_id = await db.get_setting("deposit_upi_id") or "-"
+            upi_qr = await db.get_setting("deposit_upi_qr_path")
+            note = await db.get_setting("deposit_note") or ""
+            caption = (
+                "\U0001F4B3 UPI Deposit\n\n"
+                f"UPI ID: `{upi_id}`\n\n"
+                f"{note}\n\n"
+                "Jitna amount bhejna hai bhej do.\n"
+                f"Payment ke baad **{BTN_SUBMIT_UTR}** dabao."
+            )
+            await send_page(event.chat_id, caption, image_path=upi_qr, buttons=_upi_kb())
+            await _maybe_answer(event)
+            return
+
+        if action == "u:dep_upi_submit":
+            user_state[event.sender_id] = UserState(waiting_for="deposit_upi_amount", deposit_method="UPI", deposit_amount=None)
+            await event.respond("\U0001F4B5 Enter amount (number only). Example: `100`", parse_mode="md", buttons=user_menu())
+            await _maybe_answer(event)
+            return
+
+        if action == "u:dep_usdt":
+            user_state[event.sender_id] = UserState(waiting_for="deposit_usdt", deposit_method="USDT")
+            wallet = await db.get_setting("deposit_usdt_wallet") or "-"
+            caption = "\U0001FA99 USDT Deposit\n\n" f"Wallet: `{wallet}`\n\n" "Now send:\n`amount txid`"
+            await event.respond(caption, parse_mode="md", buttons=user_menu())
+            await _maybe_answer(event)
+            return
+
+        await _maybe_answer(event)
+
     @client.on(events.NewMessage(pattern=r"^/start(?:\s+(.*))?$"))
     async def on_start(event: events.NewMessage.Event) -> None:
         if not limiter.allow(event.sender_id): return
@@ -230,6 +467,10 @@ async def main() -> None:
                 return
             if data.startswith("a:"):
                 await handle_admin_callback(event, db, cfg.admin_ids, admin_state)
+                return
+
+            if data.startswith("u:"):
+                await handle_user_action(event, data)
                 return
 
             if not limiter.allow(event.sender_id):
@@ -441,6 +682,27 @@ async def main() -> None:
         
         if event.raw_text and event.raw_text.startswith("/"): return
         state = user_state.get(event.sender_id)
+        if not (state and state.waiting_for):
+            raw = (event.raw_text or "").strip()
+            text_to_action = {
+                BTN_ACCOUNT: "u:account",
+                BTN_TX: "u:tx",
+                BTN_BUY: "u:buy",
+                BTN_REFER: "u:refer",
+                BTN_DEPOSIT: "u:deposit",
+                BTN_SUPPORT: "u:support",
+                BTN_CONFIRM_BUY: "u:confirm_buy",
+                BTN_CANCEL: "u:account",
+                BTN_BACK_MENU: "u:account",
+                BTN_BACK_DEPOSIT: "u:deposit",
+                BTN_UPI: "u:dep_upi",
+                BTN_USDT: "u:dep_usdt",
+                BTN_SUBMIT_UTR: "u:dep_upi_submit",
+            }
+            action = text_to_action.get(raw)
+            if action:
+                await handle_user_action(event, action)
+                return
         if state and state.waiting_for:
             waiting = state.waiting_for
             user_state[event.sender_id] = UserState(None)
@@ -448,6 +710,12 @@ async def main() -> None:
                 if not await ensure_user(event):
                     return
                 raw = (event.raw_text or "").strip()
+                if raw in {BTN_BACK_MENU, BTN_CANCEL}:
+                    await handle_user_action(event, "u:account")
+                    return
+                if raw == BTN_BACK_DEPOSIT:
+                    await handle_user_action(event, "u:deposit")
+                    return
 
                 if waiting == "deposit_upi_amount":
                     try:
@@ -633,6 +901,12 @@ async def main() -> None:
                 if not await ensure_user(event):
                     return
                 text = (event.raw_text or "").strip()
+                if text in {BTN_BACK_MENU, BTN_CANCEL}:
+                    await handle_user_action(event, "u:account")
+                    return
+                if text == BTN_BACK_DEPOSIT:
+                    await handle_user_action(event, "u:deposit")
+                    return
                 await db.log_transaction(event.sender_id, "support", 0, text)
                 for admin_id in cfg.admin_ids:
                     try:
