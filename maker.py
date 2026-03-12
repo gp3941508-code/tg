@@ -1,5 +1,7 @@
+#!/usr/bin/env python3
 import asyncio
 from telethon import TelegramClient
+
 
 # --- CONFIGURATION ---
 API_ID = 34403046  
@@ -40,4 +42,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(make_session())
     except KeyboardInterrupt:
+
         print("\nStopped by user.")
