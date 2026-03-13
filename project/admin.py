@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+import json
 from pathlib import Path
 import phonenumbers
 from phonenumbers import geocoder
@@ -226,11 +227,53 @@ async def handle_admin_callback(
             "Deposit methods settings:",
             buttons=[
                 [Button.inline("\U0001F4B3 Set UPI ID", b"a:set_upi"), Button.inline("\U0001F4F7 Set UPI QR", b"a:set_upi_qr")],
-                [Button.inline("\U0001FA99 Set USDT Wallet", b"a:set_usdt")],
+                [Button.inline("\U0001FA99 USDT Options", b"a:usdt_opts"), Button.inline("\U0001FA99 Set USDT Wallet", b"a:set_usdt")],
                 [Button.inline("Set Deposit Note", b"a:set_deposit_note")],
                 [Button.inline("Set Min Deposit", b"a:set_min_deposit"), Button.inline("Set USDT Rate", b"a:set_usdt_rate")],
             ],
         )
+        await event.answer()
+        return
+
+    if data == "a:usdt_opts":
+        await event.respond(
+            "USDT options:",
+            buttons=[
+                [Button.inline("Add option", b"a:usdt_add"), Button.inline("List options", b"a:usdt_list")],
+                [Button.inline("Clear options", b"a:usdt_clear")],
+            ],
+        )
+        await event.answer()
+        return
+
+    if data == "a:usdt_add":
+        admin_state[event.sender_id] = AdminState(waiting_for="usdt_add_option")
+        await event.respond("Send: `Name | Address | MinUSDT`\nExample: `TRC20 | Txxx... | 10`", parse_mode="md")
+        await event.answer()
+        return
+
+    if data == "a:usdt_list":
+        raw = await db.get_setting("deposit_usdt_options") or ""
+        try:
+            data = json.loads(raw) if raw else []
+        except Exception:
+            data = []
+        if not data:
+            await event.respond("No USDT options configured.")
+        else:
+            lines = ["USDT options:"]
+            for i, opt in enumerate(data, 1):
+                name = opt.get("name", "-")
+                addr = opt.get("address", "-")
+                minu = opt.get("min_usdt", "-")
+                lines.append(f"{i}. {name} | {addr} | min {minu}")
+            await event.respond("\n".join(lines))
+        await event.answer()
+        return
+
+    if data == "a:usdt_clear":
+        await db.set_setting("deposit_usdt_options", "[]")
+        await event.respond("USDT options cleared.")
         await event.answer()
         return
 
@@ -489,6 +532,40 @@ async def handle_admin_message(
             admin_state[event.sender_id] = AdminState(waiting_for=None)
             return
         await event.respond(f"✅ Redeem code created: `{code}` | amount={amount} | max_uses={max_uses}", parse_mode="md")
+        admin_state[event.sender_id] = AdminState(waiting_for=None)
+        return
+
+    if waiting == "usdt_add_option":
+        raw = (event.raw_text or "").strip()
+        parts = [p.strip() for p in raw.split("|")]
+        if len(parts) < 3:
+            await event.respond("Use: `Name | Address | MinUSDT`", parse_mode="md")
+            admin_state[event.sender_id] = AdminState(waiting_for=None)
+            return
+        name, address, min_raw = parts[0], parts[1], parts[2]
+        if not name or not address:
+            await event.respond("Name and Address are required.")
+            admin_state[event.sender_id] = AdminState(waiting_for=None)
+            return
+        try:
+            min_usdt = Decimal(min_raw)
+            if min_usdt <= 0:
+                raise ValueError("non_positive")
+        except (InvalidOperation, ValueError):
+            await event.respond("MinUSDT must be a positive number.")
+            admin_state[event.sender_id] = AdminState(waiting_for=None)
+            return
+
+        raw_opts = await db.get_setting("deposit_usdt_options") or ""
+        try:
+            data = json.loads(raw_opts) if raw_opts else []
+        except Exception:
+            data = []
+        if not isinstance(data, list):
+            data = []
+        data.append({"name": name, "address": address, "min_usdt": str(min_usdt)})
+        await db.set_setting("deposit_usdt_options", json.dumps(data))
+        await event.respond(f"Added USDT option: {name} | min {min_usdt}")
         admin_state[event.sender_id] = AdminState(waiting_for=None)
         return
 
