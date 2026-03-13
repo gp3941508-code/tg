@@ -381,6 +381,57 @@ class Database:
             await db.commit()
         return len(cleaned)
 
+    async def stock_total_count(self) -> int:
+        async with aiosqlite.connect(self._path) as db:
+            cur = await db.execute("SELECT COUNT(*) FROM numbers_stock;")
+            row = await cur.fetchone()
+            return int(row[0]) if row else 0
+
+    async def list_stock(self, limit: int = 10, offset: int = 0) -> list[dict]:
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT id, item, price, status, sold_to, sold_at, created_at "
+                "FROM numbers_stock ORDER BY id DESC LIMIT ? OFFSET ?;",
+                (int(limit), int(offset)),
+            )
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def get_stock_by_id(self, stock_id: int) -> dict | None:
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT id, item, price, status, sold_to, sold_at, created_at "
+                "FROM numbers_stock WHERE id=?;",
+                (int(stock_id),),
+            )
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def update_stock_price(self, stock_id: int, new_price: int) -> bool:
+        async with aiosqlite.connect(self._path) as db:
+            cur = await db.execute(
+                "UPDATE numbers_stock SET price=? WHERE id=?;",
+                (int(new_price), int(stock_id)),
+            )
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def delete_stock(self, stock_id: int) -> dict | None:
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT id, item, price, status, sold_to FROM numbers_stock WHERE id=?;",
+                (int(stock_id),),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return None
+            await db.execute("DELETE FROM numbers_stock WHERE id=?;", (int(stock_id),))
+            await db.commit()
+            return dict(row)
+
     async def last_purchase(self, tg_id: int) -> dict | None:
         async with aiosqlite.connect(self._path) as db:
             db.row_factory = aiosqlite.Row
