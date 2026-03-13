@@ -153,7 +153,9 @@ async def main() -> None:
     admin_state: dict[int, AdminState] = {}
     limiter = RateLimiter(cfg.user_rate_limit_per_sec)
 
-    bot_session_name = os.path.join(cfg.logs_dir, "bot_client")
+    # Use a token-derived session name so switching bots doesn't reuse old sessions.
+    bot_id = cfg.bot_token.split(":", 1)[0]
+    bot_session_name = os.path.join(cfg.logs_dir, f"bot_client_{bot_id}")
     client = TelegramClient(bot_session_name, cfg.api_id, cfg.api_hash)
     await client.start(bot_token=cfg.bot_token)
     me = await client.get_me()
