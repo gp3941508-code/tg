@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -25,7 +26,7 @@ from stock_manager import StockManager
 
 @dataclass
 class UserState:
-    waiting_for: str | None = None  # "deposit_upi_amount" | "deposit_upi_utr" | "deposit_usdt" | "support"
+    waiting_for: str | None = None  # "deposit_auto_amount" | "deposit_auto_paid" | "deposit_auto_proof" | "deposit_usdt" | "redeem_code" | "support"
     deposit_method: str | None = None
     deposit_amount: int | None = None
 
@@ -60,6 +61,7 @@ def user_menu() -> list[list[Button]]:
 BTN_ACCOUNT = "\U0001F464 Account"
 BTN_TX = "\U0001F4DC Transactions"
 BTN_BUY = "\U0001F6D2 Buy"
+BTN_REDEEM = "\U0001F39F Redeem"
 BTN_REFER = "\U0001F381 Refer & Earn"
 BTN_DEPOSIT = "\U0001F4B0 Deposit"
 BTN_SUPPORT = "\U0001F6E0 Support"
@@ -68,10 +70,16 @@ BTN_CONFIRM_BUY = "\u2705 Confirm & Buy"
 BTN_CANCEL = "\u274C Cancel"
 BTN_BACK_MENU = "\U0001F519 Menu"
 BTN_BACK_DEPOSIT = "\U0001F519 Deposit"
+BTN_BACK = "\U0001F519 Back"
 
 BTN_UPI = "\U0001F4B3 UPI"
 BTN_USDT = "\U0001FA99 USDT"
-BTN_SUBMIT_UTR = "\u2705 Submit UTR"
+BTN_AUTO = "\U0001F7E2 Automatic"
+BTN_MANUAL = "\U0001F7E1 Manual"
+BTN_PAID = "\u2705 Paid"
+
+BTN_BUY_AGAIN = "\U0001F6D2 Buy again"
+BTN_RESEND_OTP = "\U0001F501 Resend OTP"
 
 def _reply_kb(rows: list[list[str]], *, resize: bool = True) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -85,8 +93,9 @@ def user_menu() -> ReplyKeyboardMarkup:
     return _reply_kb(
         [
             [BTN_ACCOUNT, BTN_TX],
-            [BTN_BUY, BTN_REFER],
-            [BTN_DEPOSIT, BTN_SUPPORT],
+            [BTN_BUY, BTN_REDEEM],
+            [BTN_REFER, BTN_DEPOSIT],
+            [BTN_SUPPORT],
         ]
     )
 
@@ -94,10 +103,19 @@ def _buy_confirm_kb() -> ReplyKeyboardMarkup:
     return _reply_kb([[BTN_CONFIRM_BUY, BTN_CANCEL], [BTN_BACK_MENU]])
 
 def _deposit_methods_kb() -> ReplyKeyboardMarkup:
-    return _reply_kb([[BTN_UPI, BTN_USDT], [BTN_BACK_MENU]])
+    return _reply_kb([[BTN_AUTO, BTN_MANUAL], [BTN_BACK_MENU]])
 
-def _upi_kb() -> ReplyKeyboardMarkup:
-    return _reply_kb([[BTN_SUBMIT_UTR], [BTN_BACK_DEPOSIT, BTN_BACK_MENU]])
+def _manual_methods_kb() -> ReplyKeyboardMarkup:
+    return _reply_kb([[BTN_USDT], [BTN_BACK_DEPOSIT, BTN_BACK_MENU]])
+
+def _deposit_back_kb() -> ReplyKeyboardMarkup:
+    return _reply_kb([[BTN_BACK_DEPOSIT, BTN_BACK_MENU]])
+
+def _paid_kb() -> ReplyKeyboardMarkup:
+    return _reply_kb([[BTN_PAID], [BTN_BACK_DEPOSIT, BTN_BACK_MENU]])
+
+def _post_purchase_kb() -> ReplyKeyboardMarkup:
+    return _reply_kb([[BTN_BUY_AGAIN, BTN_RESEND_OTP], [BTN_BACK]])
 
 # --- UPGRADED: Automatic Country Detection ---
 def get_country_info(phone: str) -> str:
@@ -152,6 +170,27 @@ async def main() -> None:
     user_state: dict[int, UserState] = {}
     admin_state: dict[int, AdminState] = {}
     limiter = RateLimiter(cfg.user_rate_limit_per_sec)
+    otp_tasks: dict[int, asyncio.Task] = {}
+
+    def _start_otp_task(user_id: int, session_path: Path, stock_id: int) -> None:
+        existing = otp_tasks.get(user_id)
+        if existing and not existing.done():
+            return
+        task = asyncio.create_task(
+            stock.start_otp_listener(
+                session_path=session_path,
+                user_id=user_id,
+                stock_id=stock_id,
+                bot_client=client,
+            )
+        )
+        otp_tasks[user_id] = task
+
+        def _cleanup(_task: asyncio.Task) -> None:
+            if otp_tasks.get(user_id) is _task:
+                otp_tasks.pop(user_id, None)
+
+        task.add_done_callback(_cleanup)
 
     # Use a token-derived session name so switching bots doesn't reuse old sessions.
     bot_id = cfg.bot_token.split(":", 1)[0]
@@ -185,6 +224,20 @@ async def main() -> None:
             await asyncio.sleep(int(e.seconds) + 1)
             await client.send_file(to_id, file_path, caption=caption, buttons=buttons, parse_mode="md")
 
+    async def notify_admins_deposit(req_id: int, text: str, proof_path: str | None = None) -> None:
+        admin_buttons = [[
+            Button.inline("\u2705 Accept", f"a:dep_accept:{req_id}".encode("utf-8")),
+            Button.inline("\u274C Decline", f"a:dep_decline:{req_id}".encode("utf-8")),
+        ]]
+        for admin_id in cfg.admin_ids:
+            try:
+                if proof_path:
+                    await safe_send_file(admin_id, proof_path, caption=text, buttons=admin_buttons)
+                else:
+                    await safe_send(admin_id, text, buttons=admin_buttons)
+            except Exception:
+                logger.exception("Failed to notify admin %s", admin_id)
+
     async def ensure_user(event: events.NewMessage.Event) -> bool:
         sender = await event.get_sender()
         await db.upsert_user(event.sender_id, getattr(sender, "username", None), getattr(sender, "first_name", None))
@@ -207,6 +260,33 @@ async def main() -> None:
     async def get_ui_image(key: str) -> str | None:
         val = await db.get_setting(key)
         return val if val and val.strip() else None
+
+    async def get_min_deposit_inr() -> int:
+        raw = await db.get_setting("min_deposit_inr")
+        try:
+            value = int(raw) if raw is not None else 50
+        except Exception:
+            value = 50
+        return value if value > 0 else 50
+
+    async def get_usdt_rate_inr() -> Decimal:
+        raw = await db.get_setting("usdt_rate_inr")
+        try:
+            rate = Decimal(raw) if raw is not None else Decimal("94")
+        except Exception:
+            rate = Decimal("94")
+        if rate <= 0:
+            rate = Decimal("94")
+        return rate
+
+    def _format_usdt_from_inr(inr_amount: int, rate: Decimal) -> str:
+        if rate <= 0:
+            return "0"
+        usdt = (Decimal(inr_amount) / rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return f"{usdt}"
+
+    def _inr_from_usdt(usdt_amount: Decimal, rate: Decimal) -> int:
+        return int((usdt_amount * rate).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
     async def _maybe_answer(ev, *args, **kwargs) -> None:
         fn = getattr(ev, "answer", None)
@@ -275,20 +355,13 @@ async def main() -> None:
                 f"\U0001F4DE **Number:** `{phone_display}`\n"
                 f"\U0001F30D **Country:** {country_info}\n"
                 f"\U0001F4B0 Price: `{res.price} INR`\n\n"
-                "\u231B **Bot is now monitoring for OTP...**\n"
+                "\u23F3 **Waiting for OTP...**\n"
                 "Please login. Code will appear here.",
-                buttons=user_menu(),
+                buttons=_post_purchase_kb(),
             )
 
             session_path = Path(cfg.sessions_dir) / res.item
-            asyncio.create_task(
-                stock.start_otp_listener(
-                    session_path=session_path,
-                    user_id=event.sender_id,
-                    stock_id=res.stock_id,
-                    bot_client=client,
-                )
-            )
+            _start_otp_task(event.sender_id, session_path, res.stock_id)
             await _maybe_answer(event)
             return
 
@@ -347,20 +420,70 @@ async def main() -> None:
             await _maybe_answer(event)
             return
 
+        if action == "u:resend_otp":
+            last = await db.last_purchase(event.sender_id)
+            if not last:
+                await event.respond("No purchase found.", buttons=_post_purchase_kb())
+                await _maybe_answer(event)
+                return
+            otp = last.get("otp_code")
+            if otp:
+                await event.respond(f"\U0001F511 **OTP:** `{otp}`", parse_mode="md", buttons=_post_purchase_kb())
+                await _maybe_answer(event)
+                return
+            session_item = last.get("item")
+            if not session_item:
+                await event.respond("OTP not available yet. Please wait.", buttons=_post_purchase_kb())
+                await _maybe_answer(event)
+                return
+            session_path = Path(cfg.sessions_dir) / session_item
+            _start_otp_task(event.sender_id, session_path, int(last["id"]))
+            await event.respond("\u23F3 Still waiting for OTP. We will notify you here.", buttons=_post_purchase_kb())
+            await _maybe_answer(event)
+            return
+
         if action == "u:deposit":
             text = await get_ui_text("deposit_text", DEFAULT_DEPOSIT_TEXT)
-            upi_id = await db.get_setting("deposit_upi_id") or "-"
-            usdt_wallet = await db.get_setting("deposit_usdt_wallet") or "-"
             deposit_note = await db.get_setting("deposit_note") or ""
             full = (
                 f"{text}\n\n"
-                "\u26A0\uFE0F Deposit manually add by admin.\n\n"
-                f"{BTN_UPI} ID: `{upi_id}`\n"
-                f"{BTN_USDT} Wallet: `{usdt_wallet}`\n\n"
-                f"{deposit_note}\n\n"
-                "Choose a method from the keyboard:"
+                "\U0001F4B3 **Select Payment Method:**\n\n"
+                "\U0001F7E2 Choose Automatic for instant credit.\n"
+                "\U0001F7E1 Choose Manual for other methods.\n\n"
+                f"{deposit_note}".strip()
             )
             await event.respond(full, parse_mode="md", buttons=_deposit_methods_kb())
+            await _maybe_answer(event)
+            return
+
+        if action == "u:dep_auto" or action == "u:dep_upi":
+            min_inr = await get_min_deposit_inr()
+            rate = await get_usdt_rate_inr()
+            min_usdt = _format_usdt_from_inr(min_inr, rate)
+            user_state[event.sender_id] = UserState(waiting_for="deposit_auto_amount", deposit_method="UPI", deposit_amount=None)
+            text = (
+                "\u2B07\uFE0F Please enter the amount to deposit in INR:\n\n"
+                f"\u2705 Minimum Deposit: \u20B9{min_inr} (~${min_usdt})\n"
+                f"\U0001F449 Rate: 1 USDT = \u20B9{rate}"
+            )
+            await event.respond(text, parse_mode="md", buttons=_deposit_back_kb())
+            await _maybe_answer(event)
+            return
+
+        if action == "u:dep_manual":
+            await event.respond("Select manual method:", buttons=_manual_methods_kb())
+            await _maybe_answer(event)
+            return
+
+        if action == "u:dep_paid":
+            state = user_state.get(event.sender_id)
+            amount = state.deposit_amount if state else None
+            if not amount:
+                await event.respond("Please enter the amount first.", buttons=_deposit_back_kb())
+                await _maybe_answer(event)
+                return
+            user_state[event.sender_id] = UserState(waiting_for="deposit_auto_proof", deposit_method="UPI", deposit_amount=amount)
+            await event.respond("\u26A1 **Verification Step**\n\nPlease send the SCREENSHOT of the payment now.", parse_mode="md", buttons=_deposit_back_kb())
             await _maybe_answer(event)
             return
 
@@ -371,32 +494,26 @@ async def main() -> None:
             await _maybe_answer(event)
             return
 
-        if action == "u:dep_upi":
-            upi_id = await db.get_setting("deposit_upi_id") or "-"
-            upi_qr = await db.get_setting("deposit_upi_qr_path")
-            note = await db.get_setting("deposit_note") or ""
-            caption = (
-                "\U0001F4B3 UPI Deposit\n\n"
-                f"UPI ID: `{upi_id}`\n\n"
-                f"{note}\n\n"
-                "Jitna amount bhejna hai bhej do.\n"
-                f"Payment ke baad **{BTN_SUBMIT_UTR}** dabao."
-            )
-            await send_page(event.chat_id, caption, image_path=upi_qr, buttons=_upi_kb())
-            await _maybe_answer(event)
-            return
-
-        if action == "u:dep_upi_submit":
-            user_state[event.sender_id] = UserState(waiting_for="deposit_upi_amount", deposit_method="UPI", deposit_amount=None)
-            await event.respond("\U0001F4B5 Enter amount (number only). Example: `100`", parse_mode="md", buttons=user_menu())
-            await _maybe_answer(event)
-            return
-
         if action == "u:dep_usdt":
             user_state[event.sender_id] = UserState(waiting_for="deposit_usdt", deposit_method="USDT")
             wallet = await db.get_setting("deposit_usdt_wallet") or "-"
-            caption = "\U0001FA99 USDT Deposit\n\n" f"Wallet: `{wallet}`\n\n" "Now send:\n`amount txid`"
+            rate = await get_usdt_rate_inr()
+            min_inr = await get_min_deposit_inr()
+            min_usdt = _format_usdt_from_inr(min_inr, rate)
+            caption = (
+                "\U0001FA99 **USDT Manual Deposit**\n\n"
+                f"Wallet: `{wallet}`\n\n"
+                f"\u2705 Minimum Deposit: \u20B9{min_inr} (~${min_usdt})\n"
+                f"\U0001F449 Rate: 1 USDT = \u20B9{rate}\n\n"
+                "Send: `amount txid`\nExample: `10.5 0xabc...`"
+            )
             await event.respond(caption, parse_mode="md", buttons=user_menu())
+            await _maybe_answer(event)
+            return
+
+        if action == "u:redeem":
+            user_state[event.sender_id] = UserState(waiting_for="redeem_code")
+            await event.respond("Send your redeem code:", buttons=user_menu())
             await _maybe_answer(event)
             return
 
@@ -701,6 +818,8 @@ async def main() -> None:
                 BTN_ACCOUNT: "u:account",
                 BTN_TX: "u:tx",
                 BTN_BUY: "u:buy",
+                BTN_BUY_AGAIN: "u:buy",
+                BTN_REDEEM: "u:redeem",
                 BTN_REFER: "u:refer",
                 BTN_DEPOSIT: "u:deposit",
                 BTN_SUPPORT: "u:support",
@@ -708,9 +827,13 @@ async def main() -> None:
                 BTN_CANCEL: "u:account",
                 BTN_BACK_MENU: "u:account",
                 BTN_BACK_DEPOSIT: "u:deposit",
-                BTN_UPI: "u:dep_upi",
+                BTN_BACK: "u:account",
+                BTN_AUTO: "u:dep_auto",
+                BTN_MANUAL: "u:dep_manual",
+                BTN_UPI: "u:dep_auto",
                 BTN_USDT: "u:dep_usdt",
-                BTN_SUBMIT_UTR: "u:dep_upi_submit",
+                BTN_PAID: "u:dep_paid",
+                BTN_RESEND_OTP: "u:resend_otp",
             }
             action = text_to_action.get(raw)
             if action:
@@ -719,78 +842,103 @@ async def main() -> None:
         if state and state.waiting_for:
             waiting = state.waiting_for
             user_state[event.sender_id] = UserState(None)
-            if waiting in {"deposit_upi_amount", "deposit_upi_utr", "deposit_usdt"}:
+
+            if waiting in {"deposit_auto_amount", "deposit_auto_paid", "deposit_auto_proof", "deposit_usdt"}:
                 if not await ensure_user(event):
                     return
                 raw = (event.raw_text or "").strip()
-                if raw in {BTN_BACK_MENU, BTN_CANCEL}:
+                if raw in {BTN_BACK_MENU, BTN_CANCEL, BTN_BACK}:
                     await handle_user_action(event, "u:account")
                     return
                 if raw == BTN_BACK_DEPOSIT:
                     await handle_user_action(event, "u:deposit")
                     return
 
-                if waiting == "deposit_upi_amount":
+                if waiting == "deposit_auto_amount":
                     try:
                         amount = int(raw)
                     except Exception:
-                        user_state[event.sender_id] = UserState(waiting_for="deposit_upi_amount", deposit_method="UPI", deposit_amount=None)
-                        await event.respond("❌ Amount number only. Example: `100`", parse_mode="md")
+                        user_state[event.sender_id] = UserState(waiting_for="deposit_auto_amount", deposit_method="UPI", deposit_amount=None)
+                        await event.respond("? Amount number only. Example: `100`", parse_mode="md", buttons=_deposit_back_kb())
                         return
                     if amount <= 0:
-                        user_state[event.sender_id] = UserState(waiting_for="deposit_upi_amount", deposit_method="UPI", deposit_amount=None)
-                        await event.respond("❌ Amount must be > 0.")
+                        user_state[event.sender_id] = UserState(waiting_for="deposit_auto_amount", deposit_method="UPI", deposit_amount=None)
+                        await event.respond("? Amount must be > 0.", buttons=_deposit_back_kb())
                         return
-                    user_state[event.sender_id] = UserState(waiting_for="deposit_upi_utr", deposit_method="UPI", deposit_amount=amount)
-                    await event.respond("🧾 Now send your UTR number.", buttons=user_menu())
+                    min_inr = await get_min_deposit_inr()
+                    if amount < min_inr:
+                        rate = await get_usdt_rate_inr()
+                        min_usdt = _format_usdt_from_inr(min_inr, rate)
+                        user_state[event.sender_id] = UserState(waiting_for="deposit_auto_amount", deposit_method="UPI", deposit_amount=None)
+                        await event.respond(f"? Minimum deposit is ?{min_inr} (~${min_usdt}).", parse_mode="md", buttons=_deposit_back_kb())
+                        return
+
+                    user_state[event.sender_id] = UserState(waiting_for="deposit_auto_paid", deposit_method="UPI", deposit_amount=amount)
+                    rate = await get_usdt_rate_inr()
+                    usdt = _format_usdt_from_inr(amount, rate)
+                    upi_id = await db.get_setting("deposit_upi_id") or "-"
+                    upi_qr = await db.get_setting("deposit_upi_qr_path")
+                    caption = f"""⚡ Scan QR to Pay
+━━━━━━━━━━━━━━━━
+💰 Amount: ₹{amount} (~${usdt})
+
+1️⃣ Scan the QR or use the UPI ID.
+2️⃣ Pay exactly ₹{amount}.
+3️⃣ Click '✅ Paid' below.
+
+UPI ID: `{upi_id}`"""
+                    await send_page(event.chat_id, caption, image_path=upi_qr, buttons=_paid_kb())
                     return
 
-                if waiting == "deposit_upi_utr":
+                if waiting == "deposit_auto_paid":
                     amount = int(state.deposit_amount or 0)
-                    utr = raw
-                    if not utr:
-                        user_state[event.sender_id] = UserState(waiting_for="deposit_upi_utr", deposit_method="UPI", deposit_amount=amount)
-                        await event.respond("❌ UTR empty. Send UTR number.")
+                    if raw != BTN_PAID:
+                        user_state[event.sender_id] = UserState(waiting_for="deposit_auto_paid", deposit_method="UPI", deposit_amount=amount)
+                        await event.respond("Please click '? Paid' after payment.", buttons=_paid_kb())
                         return
+                    user_state[event.sender_id] = UserState(waiting_for="deposit_auto_proof", deposit_method="UPI", deposit_amount=amount)
+                    await event.respond("⚡ **Verification Step**\n\nPlease send the SCREENSHOT of the payment now.", parse_mode="md", buttons=_deposit_back_kb())
+                    return
+
+                if waiting == "deposit_auto_proof":
+                    amount = int(state.deposit_amount or 0)
+                    if not event.message or not (event.message.photo or event.message.file):
+                        user_state[event.sender_id] = UserState(waiting_for="deposit_auto_proof", deposit_method="UPI", deposit_amount=amount)
+                        await event.respond("Please send the payment screenshot (photo/file).", buttons=_deposit_back_kb())
+                        return
+
                     method = "UPI"
-                    reference = utr
-                    req_id = await db.create_deposit_request(event.sender_id, amount=amount, method=method, reference=reference)
-                    await db.log_transaction(event.sender_id, "deposit_request", amount, f"Request #{req_id} | {method} | UTR={reference}")
-
-                    admin_buttons = [[
-                        Button.inline("✅ Accept", f"a:dep_accept:{req_id}".encode("utf-8")),
-                        Button.inline("❌ Decline", f"a:dep_decline:{req_id}".encode("utf-8")),
-                    ]]
-                    admin_text = (
-                        f"💰 Deposit request #{req_id}\n"
-                        f"👤 User: {event.sender_id}\n"
-                        f"💵 Amount: {amount}\n"
-                        f"🔹 Method: {method}\n"
-                        f"🧾 UTR: {reference}"
-                    )
-
-                    # Optional proof media (photo/document) - download and send to admins with buttons
+                    note = "UPI QR screenshot"
+                    reference = "screenshot"
                     proof_path = None
-                    if event.message and (event.message.photo or event.message.file):
-                        try:
-                            Path("media/deposits").mkdir(parents=True, exist_ok=True)
-                            fname = event.message.file.name if event.message.file and event.message.file.name else f"proof_{event.sender_id}_{event.message.id}.jpg"
-                            dest = Path("media/deposits") / f"{req_id}_{fname}"
-                            await event.message.download_media(file=str(dest))
-                            proof_path = str(dest)
-                            await db.set_deposit_proof(req_id, proof_path)
-                        except Exception:
-                            logger.exception("Failed downloading deposit proof")
+                    try:
+                        Path("media/deposits").mkdir(parents=True, exist_ok=True)
+                        fname = event.message.file.name if event.message.file and event.message.file.name else f"proof_{event.sender_id}_{event.message.id}.jpg"
+                        dest = Path("media/deposits") / f"{event.sender_id}_{fname}"
+                        await event.message.download_media(file=str(dest))
+                        proof_path = str(dest)
+                    except Exception:
+                        logger.exception("Failed downloading deposit proof")
 
-                    for admin_id in cfg.admin_ids:
-                        try:
-                            if proof_path:
-                                await safe_send_file(admin_id, proof_path, caption=admin_text, buttons=admin_buttons)
-                            else:
-                                await safe_send(admin_id, admin_text, buttons=admin_buttons)
-                        except Exception:
-                            logger.exception("Failed to notify admin %s", admin_id)
+                    req_id = await db.create_deposit_request(
+                        event.sender_id,
+                        amount=amount,
+                        method=method,
+                        reference=reference,
+                        note=note,
+                        proof_path=proof_path,
+                    )
+                    await db.log_transaction(event.sender_id, "deposit_request", amount, f"Request #{req_id} | {method} | {note}")
 
+                    admin_text = f"""💰 Deposit request #{req_id}
+👤 User: {event.sender_id}
+💵 Amount: {amount} INR
+🔹 Method: {method}
+🧾 Proof: screenshot
+Note: {note}"""
+                    if proof_path:
+                        await db.set_deposit_proof(req_id, proof_path)
+                    await notify_admins_deposit(req_id, admin_text, proof_path=proof_path)
                     await event.respond(f"✅ Deposit request submitted.\nRequest ID: #{req_id}", buttons=user_menu())
                     return
 
@@ -801,120 +949,95 @@ async def main() -> None:
                     await event.respond("Send: `amount txid`", parse_mode="md")
                     return
                 try:
-                    amount = int(parts[0])
-                except Exception:
+                    usdt_amount = Decimal(parts[0].replace(",", ""))
+                except (InvalidOperation, ValueError):
                     user_state[event.sender_id] = UserState(waiting_for="deposit_usdt", deposit_method="USDT", deposit_amount=None)
                     await event.respond("Invalid amount. Send: `amount txid`", parse_mode="md")
                     return
-                if amount <= 0:
+                if usdt_amount <= 0:
                     user_state[event.sender_id] = UserState(waiting_for="deposit_usdt", deposit_method="USDT", deposit_amount=None)
                     await event.respond("Amount must be > 0.")
                     return
+
+                rate = await get_usdt_rate_inr()
+                inr_amount = _inr_from_usdt(usdt_amount, rate)
+                min_inr = await get_min_deposit_inr()
+                if inr_amount < min_inr:
+                    min_usdt = _format_usdt_from_inr(min_inr, rate)
+                    user_state[event.sender_id] = UserState(waiting_for="deposit_usdt", deposit_method="USDT", deposit_amount=None)
+                    await event.respond(f"? Minimum deposit is ?{min_inr} (~${min_usdt}).", parse_mode="md")
+                    return
+
                 method = "USDT"
                 reference = " ".join(parts[1:]).strip()
-                req_id = await db.create_deposit_request(event.sender_id, amount=amount, method=method, reference=reference or None)
-                await db.log_transaction(event.sender_id, "deposit_request", amount, f"Request #{req_id} | {method} | {reference}".strip())
-
-                admin_buttons = [[
-                    Button.inline("✅ Accept", f"a:dep_accept:{req_id}".encode("utf-8")),
-                    Button.inline("❌ Decline", f"a:dep_decline:{req_id}".encode("utf-8")),
-                ]]
-                admin_text = (
-                    f"💰 Deposit request #{req_id}\n"
-                    f"👤 User: {event.sender_id}\n"
-                    f"💵 Amount: {amount}\n"
-                    f"🔹 Method: {method}\n"
-                    f"🧾 TXID: {reference or '-'}"
-                )
+                note = f"USDT {usdt_amount} @ {rate} = INR {inr_amount}"
 
                 proof_path = None
                 if event.message and (event.message.photo or event.message.file):
                     try:
                         Path("media/deposits").mkdir(parents=True, exist_ok=True)
                         fname = event.message.file.name if event.message.file and event.message.file.name else f"proof_{event.sender_id}_{event.message.id}.jpg"
-                        dest = Path("media/deposits") / f"{req_id}_{fname}"
+                        dest = Path("media/deposits") / f"{event.sender_id}_{fname}"
                         await event.message.download_media(file=str(dest))
                         proof_path = str(dest)
-                        await db.set_deposit_proof(req_id, proof_path)
                     except Exception:
                         logger.exception("Failed downloading deposit proof")
 
-                for admin_id in cfg.admin_ids:
-                    try:
-                        if proof_path:
-                            await safe_send_file(admin_id, proof_path, caption=admin_text, buttons=admin_buttons)
-                        else:
-                            await safe_send(admin_id, admin_text, buttons=admin_buttons)
-                    except Exception:
-                        logger.exception("Failed to notify admin %s", admin_id)
+                req_id = await db.create_deposit_request(
+                    event.sender_id,
+                    amount=inr_amount,
+                    method=method,
+                    reference=reference or None,
+                    note=note,
+                    proof_path=proof_path,
+                )
+                await db.log_transaction(event.sender_id, "deposit_request", inr_amount, f"Request #{req_id} | {note} | TXID={reference}".strip())
+
+                admin_text = f"""💰 Deposit request #{req_id}
+👤 User: {event.sender_id}
+💵 Amount: {inr_amount} INR
+🔹 Method: {method}
+🧾 TXID: {reference or '-'}
+Note: {note}"""
+                if proof_path:
+                    await db.set_deposit_proof(req_id, proof_path)
+                await notify_admins_deposit(req_id, admin_text, proof_path=proof_path)
 
                 await event.respond(f"✅ Deposit request submitted.\nRequest ID: #{req_id}", buttons=user_menu())
                 return
+
+            if waiting == "redeem_code":
                 if not await ensure_user(event):
                     return
                 raw = (event.raw_text or "").strip()
-                parts = raw.split()
-                if len(parts) < 2:
-                    user_state[event.sender_id] = UserState(
-                        waiting_for=waiting,
-                        deposit_method="UPI" if waiting == "deposit_upi" else "USDT",
-                    )
-                    hint = "`amount reference`" if waiting == "deposit_upi" else "`amount txid`"
-                    await event.respond(f"Send: {hint}", parse_mode="md")
+                if raw in {BTN_BACK_MENU, BTN_CANCEL, BTN_BACK}:
+                    await handle_user_action(event, "u:account")
                     return
-                try:
-                    amount = int(parts[0])
-                except Exception:
-                    user_state[event.sender_id] = UserState(
-                        waiting_for=waiting,
-                        deposit_method="UPI" if waiting == "deposit_upi" else "USDT",
-                    )
-                    await event.respond("Invalid amount. Send amount first.", parse_mode="md")
+                if not raw:
+                    user_state[event.sender_id] = UserState(waiting_for="redeem_code")
+                    await event.respond("Please send a valid redeem code.")
                     return
-                if amount <= 0:
-                    user_state[event.sender_id] = UserState(
-                        waiting_for=waiting,
-                        deposit_method="UPI" if waiting == "deposit_upi" else "USDT",
-                    )
-                    await event.respond("Amount must be > 0.")
+                code = raw.strip().upper()
+                res = await db.claim_redeem_code(event.sender_id, code)
+                if not res.get("ok"):
+                    reason = res.get("reason")
+                    if reason == "already_claimed":
+                        msg = "You already claimed this code."
+                    elif reason == "exhausted":
+                        msg = "This code has already been used."
+                    else:
+                        msg = "Invalid or inactive code."
+                    await event.respond(msg, buttons=user_menu())
                     return
-
-                method = "UPI" if waiting == "deposit_upi" else "USDT"
-                reference = " ".join(parts[1:]).strip()
-                req_id = await db.create_deposit_request(
-                    event.sender_id,
-                    amount=amount,
-                    method=method,
-                    reference=reference or None,
-                )
-                await db.log_transaction(event.sender_id, "deposit_request", amount, f"Request #{req_id} | {method} | {reference}".strip())
-
-                admin_buttons = [
-                    [
-                        Button.inline("Accept", f"a:dep_accept:{req_id}".encode("utf-8")),
-                        Button.inline("Decline", f"a:dep_decline:{req_id}".encode("utf-8")),
-                    ]
-                ]
-                admin_text = (
-                    f"Deposit request #{req_id}\n"
-                    f"User: {event.sender_id}\n"
-                    f"Amount: {amount}\n"
-                    f"Method: {method}\n"
-                    f"Reference: {reference or '-'}"
-                )
-                for admin_id in cfg.admin_ids:
-                    try:
-                        await safe_send(admin_id, admin_text, buttons=admin_buttons)
-                    except Exception:
-                        logger.exception("Failed to notify admin %s", admin_id)
-
-                await event.respond(f"✅ Deposit request submitted.\nRequest ID: #{req_id}", buttons=user_menu())
+                amount = res.get("amount", 0)
+                await event.respond(f"? Redeem successful! Added {amount} INR to your balance.", buttons=user_menu())
                 return
-            elif waiting == "support":
+
+            if waiting == "support":
                 if not await ensure_user(event):
                     return
                 text = (event.raw_text or "").strip()
-                if text in {BTN_BACK_MENU, BTN_CANCEL}:
+                if text in {BTN_BACK_MENU, BTN_CANCEL, BTN_BACK}:
                     await handle_user_action(event, "u:account")
                     return
                 if text == BTN_BACK_DEPOSIT:
@@ -928,7 +1051,6 @@ async def main() -> None:
                         logger.exception("Failed to notify admin %s", admin_id)
                 await event.respond("✅ Message sent to Admin.", buttons=user_menu())
                 return
-
     logger.info("Bot is running.")
     await client.run_until_disconnected()
 
