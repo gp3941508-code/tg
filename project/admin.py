@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import phonenumbers
 from phonenumbers import geocoder
@@ -54,6 +55,7 @@ def admin_menu() -> list[list[Button]]:
         [Button.inline("Add .session to stock", b"a:add_stock"), Button.inline("View stock", b"a:view_stock")],
         [Button.inline("\U0001F4E5 Deposit requests", b"a:view_deposits"), Button.inline("\U0001F4B3 Deposit methods", b"a:deposit_methods")],
         [Button.inline("\U0001F381 Set referral bonus", b"a:set_referral_bonus"), Button.inline("\U0001F50E View referrals", b"a:view_referrals")],
+        [Button.inline("\U0001F39F Redeem codes", b"a:redeem_menu"), Button.inline("\U0001F50E Redeem claims", b"a:redeem_claims")],
         [Button.inline("\u270D\ufe0f Edit start text", b"a:edit_start_text"), Button.inline("\U0001F5BC Set start image", b"a:set_start_image")],
         [Button.inline("\u270D\ufe0f Edit dashboard text", b"a:edit_dashboard_text"), Button.inline("\U0001F5BC Set dashboard image", b"a:set_dashboard_image")],
         [Button.inline("\U0001F4B0 Add balance", b"a:add_balance"), Button.inline("\U0001F4B8 Remove balance", b"a:remove_balance")],
@@ -220,6 +222,7 @@ async def handle_admin_callback(
                 [Button.inline("\U0001F4B3 Set UPI ID", b"a:set_upi"), Button.inline("\U0001F4F7 Set UPI QR", b"a:set_upi_qr")],
                 [Button.inline("\U0001FA99 Set USDT Wallet", b"a:set_usdt")],
                 [Button.inline("Set Deposit Note", b"a:set_deposit_note")],
+                [Button.inline("Set Min Deposit", b"a:set_min_deposit"), Button.inline("Set USDT Rate", b"a:set_usdt_rate")],
             ],
         )
         await event.answer()
@@ -249,6 +252,64 @@ async def handle_admin_callback(
         await event.answer()
         return
 
+    if data == "a:set_min_deposit":
+        admin_state[event.sender_id] = AdminState(waiting_for="set_text", setting_key="min_deposit_inr")
+        await event.respond("Send minimum deposit in INR (number). Example: `50`", parse_mode="md")
+        await event.answer()
+        return
+
+    if data == "a:set_usdt_rate":
+        admin_state[event.sender_id] = AdminState(waiting_for="set_text", setting_key="usdt_rate_inr")
+        await event.respond("Send USDT rate in INR (number). Example: `94`", parse_mode="md")
+        await event.answer()
+        return
+
+    if data == "a:redeem_menu":
+        await event.respond(
+            "Redeem codes:",
+            buttons=[
+                [Button.inline("Create code", b"a:redeem_create"), Button.inline("List codes", b"a:redeem_list")],
+                [Button.inline("View claims", b"a:redeem_claims")],
+            ],
+        )
+        await event.answer()
+        return
+
+    if data == "a:redeem_create":
+        admin_state[event.sender_id] = AdminState(waiting_for="redeem_create")
+        await event.respond("Send: `CODE AMOUNT [MAX_USES]`\nExample: `WELCOME50 50 1`", parse_mode="md")
+        await event.answer()
+        return
+
+    if data == "a:redeem_list":
+        codes = await db.list_redeem_codes(limit=15)
+        if not codes:
+            await event.respond("No redeem codes found.")
+            await event.answer()
+            return
+        lines = ["Redeem codes (latest first):"]
+        for c in codes:
+            status = "active" if int(c.get("is_active", 1)) == 1 else "inactive"
+            lines.append(
+                f"{c['code']} | amount={c['amount']} | used={c['used_count']}/{c['max_uses']} | {status}"
+            )
+        await event.respond("\n".join(lines))
+        await event.answer()
+        return
+
+    if data == "a:redeem_claims":
+        claims = await db.list_redeem_claims(limit=20)
+        if not claims:
+            await event.respond("No redeem claims yet.")
+            await event.answer()
+            return
+        lines = ["Redeem claims (latest first):"]
+        for c in claims:
+            lines.append(f"{c['code']} | user={c['tg_id']} | amount={c['amount']} | at={c['claimed_at']}")
+        await event.respond("\n".join(lines))
+        await event.answer()
+        return
+
     if data == "a:view_deposits":
         reqs = await db.list_deposit_requests(status="pending", limit=10)
         if not reqs:
@@ -263,12 +324,14 @@ async def handle_admin_callback(
                     Button.inline("Decline", f"a:dep_decline:{rid}".encode("utf-8")),
                 ]
             ]
+            note = r.get("note") or "-"
             await event.respond(
                 f"Deposit request #{rid}\n"
                 f"User: {r['tg_id']}\n"
                 f"Amount: {r['amount']}\n"
                 f"Method: {r['method']}\n"
-                f"Reference: {r.get('reference') or '-'}",
+                f"Reference: {r.get('reference') or '-'}\n"
+                f"Note: {note}",
                 buttons=buttons,
             )
         await event.answer()
@@ -383,6 +446,46 @@ async def handle_admin_message(
         admin_state[event.sender_id] = AdminState(waiting_for=None)
         return
 
+    if waiting == "redeem_create":
+        raw = (event.raw_text or "").strip()
+        parts = raw.split()
+        if len(parts) < 2:
+            await event.respond("Use: `CODE AMOUNT [MAX_USES]`", parse_mode="md")
+            admin_state[event.sender_id] = AdminState(waiting_for=None)
+            return
+        code = parts[0].strip().upper()
+        try:
+            amount = int(parts[1])
+        except Exception:
+            await event.respond("Amount must be numeric.")
+            admin_state[event.sender_id] = AdminState(waiting_for=None)
+            return
+        if amount <= 0:
+            await event.respond("Amount must be > 0.")
+            admin_state[event.sender_id] = AdminState(waiting_for=None)
+            return
+        max_uses = 1
+        if len(parts) >= 3:
+            try:
+                max_uses = int(parts[2])
+            except Exception:
+                await event.respond("Max uses must be numeric.")
+                admin_state[event.sender_id] = AdminState(waiting_for=None)
+                return
+        if max_uses <= 0:
+            await event.respond("Max uses must be > 0.")
+            admin_state[event.sender_id] = AdminState(waiting_for=None)
+            return
+        res = await db.create_redeem_code(code, amount, max_uses, created_by=event.sender_id)
+        if not res.get("ok"):
+            reason = res.get("reason") or "failed"
+            await event.respond(f"Failed to create code: {reason}")
+            admin_state[event.sender_id] = AdminState(waiting_for=None)
+            return
+        await event.respond(f"✅ Redeem code created: `{code}` | amount={amount} | max_uses={max_uses}", parse_mode="md")
+        admin_state[event.sender_id] = AdminState(waiting_for=None)
+        return
+
     if waiting == "amount":
         uid = state.target_user_id
         action = state.picker_action
@@ -436,6 +539,34 @@ async def handle_admin_message(
                 return
             await db.set_setting("referral_bonus", str(bonus))
             await event.respond("✅ Referral bonus updated.")
+            admin_state[event.sender_id] = AdminState(waiting_for=None)
+            return
+        if state.setting_key == "min_deposit_inr":
+            raw = (event.raw_text or "").strip()
+            try:
+                minimum = int(raw)
+                if minimum <= 0:
+                    raise ValueError("non_positive")
+            except Exception:
+                await event.respond("Minimum deposit must be a positive number.")
+                admin_state[event.sender_id] = AdminState(waiting_for=None)
+                return
+            await db.set_setting("min_deposit_inr", str(minimum))
+            await event.respond("✅ Minimum deposit updated.")
+            admin_state[event.sender_id] = AdminState(waiting_for=None)
+            return
+        if state.setting_key == "usdt_rate_inr":
+            raw = (event.raw_text or "").strip()
+            try:
+                rate = Decimal(raw)
+                if rate <= 0:
+                    raise ValueError("non_positive")
+            except (InvalidOperation, ValueError):
+                await event.respond("USDT rate must be a positive number.")
+                admin_state[event.sender_id] = AdminState(waiting_for=None)
+                return
+            await db.set_setting("usdt_rate_inr", str(rate))
+            await event.respond("✅ USDT rate updated.")
             admin_state[event.sender_id] = AdminState(waiting_for=None)
             return
         if not state.setting_key:
