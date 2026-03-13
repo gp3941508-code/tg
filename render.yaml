@@ -7,6 +7,6 @@ services:
       - key: PYTHON_VERSION
         value: 3.10.0
     # Dependencies install karne ki command
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r project/requirements.txt
     # Bot start karne ki command
-    startCommand: python bot.py
+    startCommand: python project/bot.py
