@@ -1,10 +1,12 @@
 import os
 from dataclasses import dataclass
 
-from dotenv import load_dotenv
-
-
-load_dotenv()
+# dotenv optional (container में नहीं भी हो तो bot चले)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 
 def _get_env_int(name: str, default: int) -> int:
@@ -48,12 +50,13 @@ def load_config() -> Config:
     api_id = _get_env_int("API_ID", 0)
     api_hash = _get_env_str("API_HASH", "")
     bot_token = _get_env_str("BOT_TOKEN", "")
+
     if not api_id or not api_hash or not bot_token:
-        raise RuntimeError("Set API_ID, API_HASH, BOT_TOKEN in .env")
+        raise RuntimeError("Set API_ID, API_HASH, BOT_TOKEN in environment variables")
 
     admin_ids = set(_get_env_int_list("ADMIN_IDS"))
     if not admin_ids:
-        raise RuntimeError("Set ADMIN_IDS (comma-separated) in .env")
+        raise RuntimeError("Set ADMIN_IDS (comma-separated)")
 
     return Config(
         api_id=api_id,
@@ -66,4 +69,3 @@ def load_config() -> Config:
         default_item_price=_get_env_int("DEFAULT_ITEM_PRICE", 10),
         user_rate_limit_per_sec=float(os.getenv("USER_RATE_LIMIT_PER_SEC", "1.0")),
     )
-
