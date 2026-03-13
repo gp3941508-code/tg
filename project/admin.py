@@ -54,6 +54,8 @@ def admin_menu() -> list[list[Button]]:
 def admin_menu() -> list[list[Button]]:
     return [
         [Button.inline("Add .session to stock", b"a:add_stock"), Button.inline("View stock", b"a:view_stock")],
+        [Button.inline("Stock list", b"a:stock_list"), Button.inline("Change price", b"a:stock_price")],
+        [Button.inline("Delete stock", b"a:stock_delete")],
         [Button.inline("\U0001F4E5 Deposit requests", b"a:view_deposits"), Button.inline("\U0001F4B3 Deposit methods", b"a:deposit_methods")],
         [Button.inline("\U0001F381 Set referral bonus", b"a:set_referral_bonus"), Button.inline("\U0001F50E View referrals", b"a:view_referrals")],
         [Button.inline("\U0001F39F Redeem codes", b"a:redeem_menu"), Button.inline("\U0001F50E Redeem claims", b"a:redeem_claims")],
@@ -101,6 +103,35 @@ async def _render_user_picker(event: events.CallbackQuery.Event, db: Database, a
     await event.edit(f"Select user for: `{action}`\nUsers: {total}", buttons=buttons, parse_mode="md")
 
 
+async def _render_stock_list(event: events.CallbackQuery.Event, db: Database, offset: int = 0) -> None:
+    limit = 10
+    total = await db.stock_total_count()
+    rows = await db.list_stock(limit=limit, offset=offset)
+    if not rows:
+        await event.edit("No stock items.")
+        return
+
+    start = offset + 1
+    end = min(offset + limit, total)
+    lines = [f"Stock list ({start}-{end} of {total}):"]
+    for r in rows:
+        lines.append(
+            f"#{r.get('id')} | {r.get('status')} | ₹{r.get('price')} | {r.get('item')}"
+        )
+
+    buttons: list[list[Button]] = []
+    nav: list[Button] = []
+    if offset > 0:
+        nav.append(Button.inline("\u2b05\ufe0f Prev", f"a:stock_page:{max(0, offset - limit)}".encode("utf-8")))
+    if offset + limit < total:
+        nav.append(Button.inline("\u27a1\ufe0f Next", f"a:stock_page:{offset + limit}".encode("utf-8")))
+    if nav:
+        buttons.append(nav)
+    buttons.append([Button.inline("\u274C Close", b"a:close")])
+
+    await event.edit("\n".join(lines), buttons=buttons)
+
+
 async def render_admin_panel(event: events.NewMessage.Event, db: Database) -> None:
     counts = await db.stock_counts()
     await event.respond(
@@ -137,6 +168,13 @@ async def handle_admin_callback(
         parts = data.split(":")
         if len(parts) == 4 and parts[3].isdigit():
             await _render_user_picker(event, db, action=parts[2], offset=int(parts[3]))
+            await event.answer()
+            return
+
+    if data.startswith("a:stock_page:"):
+        parts = data.split(":")
+        if len(parts) == 3 and parts[2].isdigit():
+            await _render_stock_list(event, db, offset=int(parts[2]))
             await event.answer()
             return
 
@@ -186,6 +224,24 @@ async def handle_admin_callback(
         )
         await event.answer()
         return
+
+    if data == "a:stock_list":
+        await _render_stock_list(event, db, offset=0)
+        await event.answer()
+        return
+
+    if data == "a:stock_price":
+        admin_state[event.sender_id] = AdminState(waiting_for="stock_price")
+        await event.respond("Send: `ID NEW_PRICE` (example: `123 50`)", parse_mode="md")
+        await event.answer()
+        return
+
+    if data == "a:stock_delete":
+        admin_state[event.sender_id] = AdminState(waiting_for="stock_delete")
+        await event.respond("Send stock ID to delete. Example: `123`", parse_mode="md")
+        await event.answer()
+        return
+
 
     if data == "a:edit_start_text":
         admin_state[event.sender_id] = AdminState(waiting_for="set_text", setting_key="start_text")
@@ -477,6 +533,62 @@ async def handle_admin_message(
         # Process complete, clear state
         admin_state[event.sender_id] = AdminState(waiting_for=None)
 
+
+    if waiting == "stock_price":
+        raw = (event.raw_text or "").strip()
+        parts = raw.split()
+        if len(parts) < 2 or not parts[0].isdigit():
+            await event.respond("Use: `ID NEW_PRICE` (example: `123 50`)", parse_mode="md")
+            admin_state[event.sender_id] = AdminState(waiting_for=None)
+            return
+        stock_id = int(parts[0])
+        try:
+            new_price = int(parts[1])
+        except Exception:
+            await event.respond("Price must be numeric.")
+            admin_state[event.sender_id] = AdminState(waiting_for=None)
+            return
+        if new_price <= 0:
+            await event.respond("Price must be > 0.")
+            admin_state[event.sender_id] = AdminState(waiting_for=None)
+            return
+        ok = await db.update_stock_price(stock_id, new_price)
+        if not ok:
+            await event.respond("Stock ID not found.")
+        else:
+            await event.respond(f"Price updated for #{stock_id} -> {new_price} INR")
+        admin_state[event.sender_id] = AdminState(waiting_for=None)
+        return
+
+    if waiting == "stock_delete":
+        raw = (event.raw_text or "").strip()
+        if not raw.isdigit():
+            await event.respond("Send numeric stock ID. Example: `123`", parse_mode="md")
+            admin_state[event.sender_id] = AdminState(waiting_for=None)
+            return
+        stock_id = int(raw)
+        row = await db.get_stock_by_id(stock_id)
+        if not row:
+            await event.respond("Stock ID not found.")
+            admin_state[event.sender_id] = AdminState(waiting_for=None)
+            return
+        if row.get("status") == "reserved":
+            await db.release_reservation(stock_id, reason="admin_delete")
+        deleted = await db.delete_stock(stock_id)
+        if not deleted:
+            await event.respond("Delete failed.")
+            admin_state[event.sender_id] = AdminState(waiting_for=None)
+            return
+        try:
+            if row.get("item"):
+                fpath = Path(sessions_dir) / str(row.get("item"))
+                if fpath.exists():
+                    fpath.unlink()
+        except Exception:
+            pass
+        await event.respond(f"Deleted stock #{stock_id}: {row.get('item')}")
+        admin_state[event.sender_id] = AdminState(waiting_for=None)
+        return
 
     # view referrals info
     if waiting == "view_referrals":
