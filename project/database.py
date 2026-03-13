@@ -247,6 +247,62 @@ class Database:
             await db.execute("UPDATE numbers_stock SET otp_code=? WHERE id=?;", (otp_code, stock_id))
             await db.commit()
 
+    async def finalize_sale(self, stock_id: int, otp_code: str) -> dict:
+        now = dt.datetime.utcnow().isoformat()
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE;")
+            cur = await db.execute("SELECT id, status, sold_to FROM numbers_stock WHERE id=?;", (int(stock_id),))
+            row = await cur.fetchone()
+            if not row:
+                await db.execute("ROLLBACK;")
+                return {"ok": False, "reason": "not_found"}
+
+            status = str(row["status"])
+            if status not in {"reserved", "sold"}:
+                await db.execute("ROLLBACK;")
+                return {"ok": False, "reason": "not_reserved"}
+
+            await db.execute(
+                "UPDATE numbers_stock SET status='sold', otp_code=?, sold_at=? WHERE id=?;",
+                (otp_code, now, int(stock_id)),
+            )
+            await db.commit()
+            return {"ok": True, "tg_id": int(row["sold_to"]) if row["sold_to"] is not None else None}
+
+    async def release_reservation(self, stock_id: int, reason: str = "otp_timeout") -> dict:
+        now = dt.datetime.utcnow().isoformat()
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE;")
+            cur = await db.execute(
+                "SELECT id, status, sold_to, price FROM numbers_stock WHERE id=?;",
+                (int(stock_id),),
+            )
+            row = await cur.fetchone()
+            if not row:
+                await db.execute("ROLLBACK;")
+                return {"ok": False, "reason": "not_found"}
+            if str(row["status"]) != "reserved":
+                await db.execute("ROLLBACK;")
+                return {"ok": False, "reason": "not_reserved"}
+
+            await db.execute(
+                "UPDATE numbers_stock SET status='available', sold_to=NULL, sold_at=NULL, otp_code=NULL WHERE id=?;",
+                (int(stock_id),),
+            )
+            tg_id = int(row["sold_to"]) if row["sold_to"] is not None else None
+            amount = int(row["price"])
+            if tg_id is not None and amount > 0:
+                await db.execute("UPDATE users SET balance = balance + ? WHERE tg_id=?;", (amount, tg_id))
+                await db.execute(
+                    "INSERT INTO transactions (tg_id, type, amount, description, created_at) VALUES (?, ?, ?, ?, ?);",
+                    (tg_id, "purchase_refund", amount, f"Refund for stock id={stock_id} ({reason})", now),
+                )
+
+            await db.commit()
+            return {"ok": True, "tg_id": tg_id, "amount": amount}
+
     async def purchase_one_available(self, tg_id: int) -> dict:
         now = dt.datetime.utcnow().isoformat()
         async with aiosqlite.connect(self._path) as db:
@@ -278,12 +334,12 @@ class Database:
             stock_id = int(stock_row["id"])
             await db.execute("UPDATE users SET balance = balance - ? WHERE tg_id=?;", (price, tg_id))
             await db.execute(
-                "UPDATE numbers_stock SET status='sold', sold_to=?, sold_at=? WHERE id=?;",
+                "UPDATE numbers_stock SET status='reserved', sold_to=?, sold_at=?, otp_code=NULL WHERE id=?;",
                 (tg_id, now, stock_id),
             )
             await db.execute(
                 "INSERT INTO transactions (tg_id, type, amount, description, created_at) VALUES (?, ?, ?, ?, ?);",
-                (tg_id, "purchase", -price, f"Purchased stock id={stock_id}", now),
+                (tg_id, "purchase", -price, f"Reserved stock id={stock_id}", now),
             )
             await db.commit()
             return {"ok": True, "item": stock_row["item"], "price": price, "stock_id": stock_id}
@@ -309,7 +365,7 @@ class Database:
             db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT status, COUNT(*) AS c FROM numbers_stock GROUP BY status;")
             rows = await cur.fetchall()
-            out = {"available": 0, "sold": 0}
+            out = {"available": 0, "reserved": 0, "sold": 0}
             for r in rows: out[str(r["status"])] = int(r["c"])
             return out
 
