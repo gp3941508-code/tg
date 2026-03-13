@@ -1,4 +1,4 @@
-python-dotenv
 telethon
 phonenumbers
 aiosqlite
+python-dotenv
