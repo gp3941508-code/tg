@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -29,6 +30,10 @@ class UserState:
     waiting_for: str | None = None  # "deposit_auto_amount" | "deposit_auto_paid" | "deposit_auto_proof" | "deposit_usdt" | "redeem_code" | "support"
     deposit_method: str | None = None
     deposit_amount: int | None = None
+    usdt_option_name: str | None = None
+    usdt_option_addr: str | None = None
+    usdt_min: Decimal | None = None
+    usdt_amount: Decimal | None = None
 
 class RateLimiter:
     def __init__(self, min_interval_sec: float) -> None:
@@ -77,6 +82,7 @@ BTN_USDT = "\U0001FA99 USDT"
 BTN_AUTO = "UPI"
 BTN_MANUAL = "USDT"
 BTN_PAID = "\u2705 Paid"
+BTN_USDT_SUBMIT = "Submit TXID"
 
 BTN_BUY_AGAIN = "\U0001F6D2 Buy again"
 BTN_RESEND_OTP = "\U0001F501 Resend OTP"
@@ -260,6 +266,42 @@ async def main() -> None:
     async def get_ui_image(key: str) -> str | None:
         val = await db.get_setting(key)
         return val if val and val.strip() else None
+
+    async def load_usdt_options() -> list[dict]:
+        raw = await db.get_setting("deposit_usdt_options") or ""
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return []
+        if not isinstance(data, list):
+            return []
+        out: list[dict] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            addr = str(item.get("address") or "").strip()
+            min_raw = str(item.get("min_usdt") or "").strip()
+            try:
+                min_usdt = Decimal(min_raw)
+            except Exception:
+                min_usdt = Decimal("0")
+            if not name or not addr:
+                continue
+            out.append({"name": name, "address": addr, "min_usdt": min_usdt})
+        return out
+
+    async def render_usdt_options(event, *, via_menu: bool = True) -> None:
+        options = await load_usdt_options()
+        if not options:
+            await event.respond("No USDT options configured. Please contact admin.", buttons=user_menu())
+            return
+        buttons = [[Button.inline(opt["name"], f"u:usdt_opt:{i}".encode("utf-8"))] for i, opt in enumerate(options)]
+        if via_menu:
+            buttons.append([Button.inline("\U0001F519 Back", b"u:deposit")])
+        await event.respond("Select USDT option:", buttons=buttons)
 
     async def get_min_deposit_inr() -> int:
         raw = await db.get_setting("min_deposit_inr")
@@ -495,19 +537,54 @@ async def main() -> None:
             return
 
         if action == "u:dep_usdt":
-            user_state[event.sender_id] = UserState(waiting_for="deposit_usdt", deposit_method="USDT")
-            wallet = await db.get_setting("deposit_usdt_wallet") or "-"
-            rate = await get_usdt_rate_inr()
-            min_inr = await get_min_deposit_inr()
-            min_usdt = _format_usdt_from_inr(min_inr, rate)
-            caption = (
-                "\U0001FA99 **USDT Manual Deposit**\n\n"
-                f"Wallet: `{wallet}`\n\n"
-                f"\u2705 Minimum Deposit: \u20B9{min_inr} (~${min_usdt})\n"
-                f"\U0001F449 Rate: 1 USDT = \u20B9{rate}\n\n"
-                "Send: `amount txid`\nExample: `10.5 0xabc...`"
+            await render_usdt_options(event, via_menu=True)
+            await _maybe_answer(event)
+            return
+
+        if action.startswith("u:usdt_opt:"):
+            try:
+                idx = int(action.split(":")[-1])
+            except Exception:
+                await event.respond("Invalid option. Please try again.", buttons=user_menu())
+                await _maybe_answer(event)
+                return
+            options = await load_usdt_options()
+            if idx < 0 or idx >= len(options):
+                await event.respond("Invalid option. Please try again.", buttons=user_menu())
+                await _maybe_answer(event)
+                return
+            opt = options[idx]
+            user_state[event.sender_id] = UserState(
+                waiting_for="usdt_amount",
+                deposit_method="USDT",
+                usdt_option_name=opt["name"],
+                usdt_option_addr=opt["address"],
+                usdt_min=opt["min_usdt"],
+                usdt_amount=None,
             )
-            await event.respond(caption, parse_mode="md", buttons=user_menu())
+            await event.respond(
+                f"Enter USDT amount for **{opt['name']}**\nMinimum: {opt['min_usdt']}",
+                parse_mode="md",
+                buttons=_deposit_back_kb(),
+            )
+            await _maybe_answer(event)
+            return
+
+        if action == "u:usdt_submit":
+            state = user_state.get(event.sender_id)
+            if not state or state.usdt_amount is None:
+                await event.respond("Please enter the amount first.", buttons=_deposit_back_kb())
+                await _maybe_answer(event)
+                return
+            user_state[event.sender_id] = UserState(
+                waiting_for="usdt_txid",
+                deposit_method="USDT",
+                usdt_option_name=state.usdt_option_name,
+                usdt_option_addr=state.usdt_option_addr,
+                usdt_min=state.usdt_min,
+                usdt_amount=state.usdt_amount,
+            )
+            await event.respond("Send TXID now (you can attach a screenshot).", buttons=_deposit_back_kb())
             await _maybe_answer(event)
             return
 
@@ -793,14 +870,7 @@ async def main() -> None:
                 await event.answer()
 
             elif data == "u:dep_usdt":
-                user_state[event.sender_id] = UserState(waiting_for="deposit_usdt", deposit_method="USDT")
-                wallet = await db.get_setting("deposit_usdt_wallet") or "-"
-                caption = (
-                    "\U0001FA99 USDT Deposit\n\n"
-                    f"Wallet: `{wallet}`\n\n"
-                    "Now send:\n`amount txid`"
-                )
-                await event.respond(caption, parse_mode="md", buttons=user_menu())
+                await render_usdt_options(event, via_menu=False)
                 await event.answer()
 
         except Exception:
@@ -833,6 +903,7 @@ async def main() -> None:
                 BTN_UPI: "u:dep_auto",
                 BTN_USDT: "u:dep_usdt",
                 BTN_PAID: "u:dep_paid",
+                BTN_USDT_SUBMIT: "u:usdt_submit",
                 BTN_RESEND_OTP: "u:resend_otp",
             }
             action = text_to_action.get(raw)
@@ -843,7 +914,7 @@ async def main() -> None:
             waiting = state.waiting_for
             user_state[event.sender_id] = UserState(None)
 
-            if waiting in {"deposit_auto_amount", "deposit_auto_paid", "deposit_auto_proof", "deposit_usdt"}:
+            if waiting in {"deposit_auto_amount", "deposit_auto_paid", "deposit_auto_proof", "usdt_amount", "usdt_submit", "usdt_txid"}:
                 if not await ensure_user(event):
                     return
                 raw = (event.raw_text or "").strip()
@@ -942,69 +1013,147 @@ Note: {note}"""
                     await event.respond(f"✅ Deposit request submitted.\nRequest ID: #{req_id}", buttons=user_menu())
                     return
 
-                # deposit_usdt
-                parts = raw.split()
-                if len(parts) < 2:
-                    user_state[event.sender_id] = UserState(waiting_for="deposit_usdt", deposit_method="USDT", deposit_amount=None)
-                    await event.respond("Send: `amount txid`", parse_mode="md")
-                    return
-                try:
-                    usdt_amount = Decimal(parts[0].replace(",", ""))
-                except (InvalidOperation, ValueError):
-                    user_state[event.sender_id] = UserState(waiting_for="deposit_usdt", deposit_method="USDT", deposit_amount=None)
-                    await event.respond("Invalid amount. Send: `amount txid`", parse_mode="md")
-                    return
-                if usdt_amount <= 0:
-                    user_state[event.sender_id] = UserState(waiting_for="deposit_usdt", deposit_method="USDT", deposit_amount=None)
-                    await event.respond("Amount must be > 0.")
-                    return
-
-                rate = await get_usdt_rate_inr()
-                inr_amount = _inr_from_usdt(usdt_amount, rate)
-                min_inr = await get_min_deposit_inr()
-                if inr_amount < min_inr:
-                    min_usdt = _format_usdt_from_inr(min_inr, rate)
-                    user_state[event.sender_id] = UserState(waiting_for="deposit_usdt", deposit_method="USDT", deposit_amount=None)
-                    await event.respond(f"? Minimum deposit is ?{min_inr} (~${min_usdt}).", parse_mode="md")
-                    return
-
-                method = "USDT"
-                reference = " ".join(parts[1:]).strip()
-                note = f"USDT {usdt_amount} @ {rate} = INR {inr_amount}"
-
-                proof_path = None
-                if event.message and (event.message.photo or event.message.file):
+                if waiting == "usdt_amount":
                     try:
-                        Path("media/deposits").mkdir(parents=True, exist_ok=True)
-                        fname = event.message.file.name if event.message.file and event.message.file.name else f"proof_{event.sender_id}_{event.message.id}.jpg"
-                        dest = Path("media/deposits") / f"{event.sender_id}_{fname}"
-                        await event.message.download_media(file=str(dest))
-                        proof_path = str(dest)
-                    except Exception:
-                        logger.exception("Failed downloading deposit proof")
+                        usdt_amount = Decimal(raw.replace(",", ""))
+                    except (InvalidOperation, ValueError):
+                        user_state[event.sender_id] = UserState(
+                            waiting_for="usdt_amount",
+                            deposit_method="USDT",
+                            usdt_option_name=state.usdt_option_name,
+                            usdt_option_addr=state.usdt_option_addr,
+                            usdt_min=state.usdt_min,
+                            usdt_amount=None,
+                        )
+                        await event.respond("Invalid amount. Example: `10.5`", parse_mode="md", buttons=_deposit_back_kb())
+                        return
+                    if usdt_amount <= 0:
+                        user_state[event.sender_id] = UserState(
+                            waiting_for="usdt_amount",
+                            deposit_method="USDT",
+                            usdt_option_name=state.usdt_option_name,
+                            usdt_option_addr=state.usdt_option_addr,
+                            usdt_min=state.usdt_min,
+                            usdt_amount=None,
+                        )
+                        await event.respond("Amount must be > 0.", buttons=_deposit_back_kb())
+                        return
+                    min_usdt = state.usdt_min or Decimal("0")
+                    if usdt_amount < min_usdt:
+                        user_state[event.sender_id] = UserState(
+                            waiting_for="usdt_amount",
+                            deposit_method="USDT",
+                            usdt_option_name=state.usdt_option_name,
+                            usdt_option_addr=state.usdt_option_addr,
+                            usdt_min=state.usdt_min,
+                            usdt_amount=None,
+                        )
+                        await event.respond(f"Minimum is {min_usdt} USDT.", buttons=_deposit_back_kb())
+                        return
 
-                req_id = await db.create_deposit_request(
-                    event.sender_id,
-                    amount=inr_amount,
-                    method=method,
-                    reference=reference or None,
-                    note=note,
-                    proof_path=proof_path,
-                )
-                await db.log_transaction(event.sender_id, "deposit_request", inr_amount, f"Request #{req_id} | {note} | TXID={reference}".strip())
+                    user_state[event.sender_id] = UserState(
+                        waiting_for="usdt_submit",
+                        deposit_method="USDT",
+                        usdt_option_name=state.usdt_option_name,
+                        usdt_option_addr=state.usdt_option_addr,
+                        usdt_min=state.usdt_min,
+                        usdt_amount=usdt_amount,
+                    )
+                    rate = await get_usdt_rate_inr()
+                    inr_amount = _inr_from_usdt(usdt_amount, rate)
+                    caption = (
+                        f"USDT Address ({state.usdt_option_name}):\n`{state.usdt_option_addr}`\n\n"
+                        f"Amount: {usdt_amount} USDT (~₹{inr_amount})\n"
+                        f"Rate: 1 USDT = ₹{rate}\n\n"
+                        "After sending, click `Submit TXID`."
+                    )
+                    await event.respond(
+                        caption,
+                        parse_mode="md",
+                        buttons=_reply_kb([[BTN_USDT_SUBMIT], [BTN_BACK_DEPOSIT, BTN_BACK_MENU]]),
+                    )
+                    return
 
-                admin_text = f"""💰 Deposit request #{req_id}
-👤 User: {event.sender_id}
-💵 Amount: {inr_amount} INR
-🔹 Method: {method}
-🧾 TXID: {reference or '-'}
+                if waiting == "usdt_submit":
+                    if raw != BTN_USDT_SUBMIT:
+                        user_state[event.sender_id] = UserState(
+                            waiting_for="usdt_submit",
+                            deposit_method="USDT",
+                            usdt_option_name=state.usdt_option_name,
+                            usdt_option_addr=state.usdt_option_addr,
+                            usdt_min=state.usdt_min,
+                            usdt_amount=state.usdt_amount,
+                        )
+                        await event.respond(
+                            "Please click `Submit TXID`.",
+                            parse_mode="md",
+                            buttons=_reply_kb([[BTN_USDT_SUBMIT], [BTN_BACK_DEPOSIT, BTN_BACK_MENU]]),
+                        )
+                        return
+                    user_state[event.sender_id] = UserState(
+                        waiting_for="usdt_txid",
+                        deposit_method="USDT",
+                        usdt_option_name=state.usdt_option_name,
+                        usdt_option_addr=state.usdt_option_addr,
+                        usdt_min=state.usdt_min,
+                        usdt_amount=state.usdt_amount,
+                    )
+                    await event.respond("Send TXID now (you can attach a screenshot).", buttons=_deposit_back_kb())
+                    return
+
+                if waiting == "usdt_txid":
+                    txid = raw.strip()
+                    if not txid:
+                        user_state[event.sender_id] = UserState(
+                            waiting_for="usdt_txid",
+                            deposit_method="USDT",
+                            usdt_option_name=state.usdt_option_name,
+                            usdt_option_addr=state.usdt_option_addr,
+                            usdt_min=state.usdt_min,
+                            usdt_amount=state.usdt_amount,
+                        )
+                        await event.respond("Please send a valid TXID.", buttons=_deposit_back_kb())
+                        return
+
+                    usdt_amount = state.usdt_amount or Decimal("0")
+                    rate = await get_usdt_rate_inr()
+                    inr_amount = _inr_from_usdt(usdt_amount, rate)
+                    method = f"USDT ({state.usdt_option_name})"
+                    note = f"USDT {usdt_amount} @ {rate} = INR {inr_amount} | Addr: {state.usdt_option_addr}"
+
+                    proof_path = None
+                    if event.message and (event.message.photo or event.message.file):
+                        try:
+                            Path("media/deposits").mkdir(parents=True, exist_ok=True)
+                            fname = event.message.file.name if event.message.file and event.message.file.name else f"proof_{event.sender_id}_{event.message.id}.jpg"
+                            dest = Path("media/deposits") / f"{event.sender_id}_{fname}"
+                            await event.message.download_media(file=str(dest))
+                            proof_path = str(dest)
+                        except Exception:
+                            logger.exception("Failed downloading deposit proof")
+
+                    req_id = await db.create_deposit_request(
+                        event.sender_id,
+                        amount=inr_amount,
+                        method=method,
+                        reference=txid,
+                        note=note,
+                        proof_path=proof_path,
+                    )
+                    await db.log_transaction(event.sender_id, "deposit_request", inr_amount, f"Request #{req_id} | {note} | TXID={txid}".strip())
+
+                    admin_text = f"""???? Deposit request #{req_id}
+???? User: {event.sender_id}
+???? Amount: {inr_amount} INR
+???? Method: {method}
+???? TXID: {txid}
 Note: {note}"""
-                if proof_path:
-                    await db.set_deposit_proof(req_id, proof_path)
-                await notify_admins_deposit(req_id, admin_text, proof_path=proof_path)
+                    if proof_path:
+                        await db.set_deposit_proof(req_id, proof_path)
+                    await notify_admins_deposit(req_id, admin_text, proof_path=proof_path)
 
-                await event.respond(f"✅ Deposit request submitted.\nRequest ID: #{req_id}", buttons=user_menu())
-                return
+                    await event.respond(f"Deposit request submitted.\nRequest ID: #{req_id}", buttons=user_menu())
+                    return
 
             if waiting == "redeem_code":
                 if not await ensure_user(event):
