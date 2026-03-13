@@ -74,7 +74,7 @@ class StockManager:
                 otp = extract_otp(event.text)
                 if otp:
                     # 1. Database update karo
-                    await self._db.update_otp(stock_id, otp)
+                    await self._db.finalize_sale(stock_id, otp)
                     
                     # 2. User ko notification bhejo
                     await bot_client.send_message(
@@ -89,12 +89,22 @@ class StockManager:
                     # Loop ko break karne ke liye hum task cancel kar sakte hain ya return
                     raise asyncio.CancelledError("OTP Found")
 
-            # 10 minute tak wait karega (600 seconds)
+            # 5 minute tak wait karega (300 seconds)
             # Agar is beech OTP mil gaya toh CancelledError throw hoga
-            await asyncio.wait_for(asyncio.sleep(600), timeout=601)
+            await asyncio.wait_for(asyncio.sleep(300), timeout=301)
             
-            # Agar bina OTP ke 10 min ho gaye:
-            await bot_client.send_message(user_id, f"⌛ OTP Timeout for `{session_path.name}`. No code received in 10 minutes.")
+            # Agar bina OTP ke 5 min ho gaye:
+            release = await self._db.release_reservation(stock_id, reason="otp_timeout")
+            if release.get("ok"):
+                await bot_client.send_message(
+                    user_id,
+                    f"OTP timeout for `{session_path.name}`. No code received in 5 minutes. Number returned to stock and refund issued.",
+                )
+            else:
+                await bot_client.send_message(
+                    user_id,
+                    f"OTP timeout for `{session_path.name}`. No code received in 5 minutes.",
+                )
 
         except asyncio.CancelledError:
             logger.info(f"OTP found and listener closed for user {user_id}")
