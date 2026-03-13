@@ -66,6 +66,6 @@ def load_config() -> Config:
         db_path=os.getenv("DB_PATH", "database.sqlite3"),
         logs_dir=os.getenv("LOGS_DIR", "logs"),
         sessions_dir=os.getenv("SESSIONS_DIR", "sessions"),
-        default_item_price=_get_env_int("DEFAULT_ITEM_PRICE", 10),
+        default_item_price=_get_env_int("DEFAULT_ITEM_PRICE", 60),
         user_rate_limit_per_sec=float(os.getenv("USER_RATE_LIMIT_PER_SEC", "1.0")),
     )
