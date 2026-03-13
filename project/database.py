@@ -134,6 +134,34 @@ class Database:
                 await db.execute("ALTER TABLE deposit_requests ADD COLUMN proof_path TEXT;")
             except aiosqlite.OperationalError:
                 pass
+
+            # Redeem codes
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS redeem_codes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code TEXT NOT NULL UNIQUE,
+                    amount INTEGER NOT NULL,
+                    max_uses INTEGER NOT NULL DEFAULT 1,
+                    used_count INTEGER NOT NULL DEFAULT 0,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    created_by INTEGER
+                );
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS redeem_claims (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code_id INTEGER NOT NULL,
+                    tg_id INTEGER NOT NULL,
+                    claimed_at TEXT NOT NULL,
+                    UNIQUE(code_id, tg_id),
+                    FOREIGN KEY(code_id) REFERENCES redeem_codes(id)
+                );
+                """
+            )
             await db.commit()
 
     # --- NEW: Confirmation Screen ke liye stock info fetch karna ---
@@ -477,15 +505,23 @@ class Database:
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
 
-    async def create_deposit_request(self, tg_id: int, amount: int, method: str, reference: str | None, proof_path: str | None = None) -> int:
+    async def create_deposit_request(
+        self,
+        tg_id: int,
+        amount: int,
+        method: str,
+        reference: str | None,
+        note: str | None = None,
+        proof_path: str | None = None,
+    ) -> int:
         now = dt.datetime.utcnow().isoformat()
         async with aiosqlite.connect(self._path) as db:
             cur = await db.execute(
                 """
-                INSERT INTO deposit_requests (tg_id, amount, method, reference, proof_path, status, created_at)
-                VALUES (?, ?, ?, ?, ?, 'pending', ?);
+                INSERT INTO deposit_requests (tg_id, amount, method, reference, note, proof_path, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?);
                 """,
-                (tg_id, int(amount), method, reference, proof_path, now),
+                (tg_id, int(amount), method, reference, note, proof_path, now),
             )
             await db.commit()
             return int(cur.lastrowid)
@@ -560,3 +596,93 @@ class Database:
                 except Exception:
                     referral_reward = None
             return {"ok": True, "request": dict(row2), "referral_reward": referral_reward}
+
+    async def create_redeem_code(self, code: str, amount: int, max_uses: int, created_by: int | None = None) -> dict:
+        now = dt.datetime.utcnow().isoformat()
+        if amount <= 0 or max_uses <= 0:
+            return {"ok": False, "reason": "invalid_amount"}
+        async with aiosqlite.connect(self._path) as db:
+            try:
+                await db.execute(
+                    """
+                    INSERT INTO redeem_codes (code, amount, max_uses, used_count, is_active, created_at, created_by)
+                    VALUES (?, ?, ?, 0, 1, ?, ?);
+                    """,
+                    (code, int(amount), int(max_uses), now, created_by),
+                )
+                await db.commit()
+                return {"ok": True}
+            except aiosqlite.IntegrityError:
+                return {"ok": False, "reason": "exists"}
+
+    async def list_redeem_codes(self, limit: int = 20) -> list[dict]:
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """
+                SELECT id, code, amount, max_uses, used_count, is_active, created_at, created_by
+                FROM redeem_codes
+                ORDER BY id DESC
+                LIMIT ?;
+                """,
+                (int(limit),),
+            )
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def list_redeem_claims(self, limit: int = 20) -> list[dict]:
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """
+                SELECT rc.code, rc.amount, rc.max_uses, rc.used_count,
+                       rcl.tg_id, rcl.claimed_at
+                FROM redeem_claims rcl
+                JOIN redeem_codes rc ON rc.id = rcl.code_id
+                ORDER BY rcl.id DESC
+                LIMIT ?;
+                """,
+                (int(limit),),
+            )
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def claim_redeem_code(self, tg_id: int, code: str) -> dict:
+        now = dt.datetime.utcnow().isoformat()
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE;")
+
+            cur = await db.execute("SELECT * FROM redeem_codes WHERE code=?;", (code,))
+            code_row = await cur.fetchone()
+            if not code_row or int(code_row["is_active"]) != 1:
+                await db.execute("ROLLBACK;")
+                return {"ok": False, "reason": "not_found"}
+            if int(code_row["used_count"]) >= int(code_row["max_uses"]):
+                await db.execute("ROLLBACK;")
+                return {"ok": False, "reason": "exhausted"}
+
+            cur = await db.execute(
+                "SELECT 1 FROM redeem_claims WHERE code_id=? AND tg_id=?;",
+                (int(code_row["id"]), int(tg_id)),
+            )
+            if await cur.fetchone():
+                await db.execute("ROLLBACK;")
+                return {"ok": False, "reason": "already_claimed"}
+
+            amount = int(code_row["amount"])
+            await db.execute(
+                "INSERT INTO redeem_claims (code_id, tg_id, claimed_at) VALUES (?, ?, ?);",
+                (int(code_row["id"]), int(tg_id), now),
+            )
+            await db.execute(
+                "UPDATE redeem_codes SET used_count = used_count + 1 WHERE id=?;",
+                (int(code_row["id"]),),
+            )
+            await db.execute("UPDATE users SET balance = balance + ? WHERE tg_id=?;", (amount, int(tg_id)))
+            await db.execute(
+                "INSERT INTO transactions (tg_id, type, amount, description, created_at) VALUES (?, ?, ?, ?, ?);",
+                (int(tg_id), "redeem", amount, f"Redeem code {code}", now),
+            )
+            await db.commit()
+            return {"ok": True, "amount": amount}
