@@ -74,8 +74,8 @@ BTN_BACK = "\U0001F519 Back"
 
 BTN_UPI = "\U0001F4B3 UPI"
 BTN_USDT = "\U0001FA99 USDT"
-BTN_AUTO = "\U0001F7E2 Automatic"
-BTN_MANUAL = "\U0001F7E1 Manual"
+BTN_AUTO = "UPI"
+BTN_MANUAL = "USDT"
 BTN_PAID = "\u2705 Paid"
 
 BTN_BUY_AGAIN = "\U0001F6D2 Buy again"
@@ -448,8 +448,8 @@ async def main() -> None:
             full = (
                 f"{text}\n\n"
                 "\U0001F4B3 **Select Payment Method:**\n\n"
-                "\U0001F7E2 Choose Automatic for instant credit.\n"
-                "\U0001F7E1 Choose Manual for other methods.\n\n"
+                "Choose UPI for instant credit.\n"
+                "Choose USDT for other methods.\n\n"
                 f"{deposit_note}".strip()
             )
             await event.respond(full, parse_mode="md", buttons=_deposit_methods_kb())
@@ -471,7 +471,7 @@ async def main() -> None:
             return
 
         if action == "u:dep_manual":
-            await event.respond("Select manual method:", buttons=_manual_methods_kb())
+            await event.respond("Select USDT method:", buttons=_manual_methods_kb())
             await _maybe_answer(event)
             return
 
