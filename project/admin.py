@@ -106,6 +106,7 @@ async def render_admin_panel(event: events.NewMessage.Event, db: Database) -> No
         f"\U0001F6E0 **Admin Panel**\n\n"
         f"\U0001F4CA **Stock Status:**\n"
         f"- Available: `{counts.get('available', 0)}`\n"
+        f"- Reserved: `{counts.get('reserved', 0)}`\n"
         f"- Sold: `{counts.get('sold', 0)}`",
         buttons=admin_menu(),
         parse_mode="md",
@@ -176,7 +177,12 @@ async def handle_admin_callback(
 
     if data == "a:view_stock":
         counts = await db.stock_counts()
-        await event.respond(f"📊 **Current Stock**\nAvailable: {counts.get('available', 0)}\nSold: {counts.get('sold', 0)}")
+        await event.respond(
+            f"📊 **Current Stock**\n"
+            f"Available: {counts.get('available', 0)}\n"
+            f"Reserved: {counts.get('reserved', 0)}\n"
+            f"Sold: {counts.get('sold', 0)}"
+        )
         await event.answer()
         return
 
